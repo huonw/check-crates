@@ -1,0 +1,186 @@
+use clap::{Arg, App};
+use std::collections::HashSet;
+use std::io;
+use std::io::prelude::*;
+use std::fs::{self, File};
+use std::process::{self, Command, Stdio};
+
+const PER_PAGE: u64 = 100;
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct Page {
+    meta: Meta,
+    crates: Vec<Crate>,
+}
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct Meta {
+    total: u64,
+}
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct Crate {
+    links: Links,
+    max_version: String,
+    homepage: Option<String>,
+    versions: Option<Vec<()>>,
+    name: String,
+    created_at: String,
+    description: String,
+    updated_at: String,
+    downloads: u64,
+    id: String,
+    repository: Option<String>,
+    keywords: Vec<String>,
+    license: String,
+    documentation: Option<String>,
+}
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct Links {
+    reverse_dependencies: String,
+    owners: String,
+    versions: String,
+    version_downloads: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct Owners {
+    users: Vec<User>
+}
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct User {
+    kind: String,
+    name: String,
+    id: u64,
+    email: Option<String>,
+    avatar: String,
+    login: String,
+    url: String,
+}
+
+fn main() {
+    env_logger::init().unwrap();
+
+    let matches = App::new("check-crates")
+        .version(&crate_version!())
+        .arg(Arg::with_name("sole_owner")
+             .short("s")
+             .long("sole-owner")
+             .help("only include crates for which the given user is the sole owner"))
+        .arg(Arg::with_name("id")
+             .index(1)
+             .help("the user id to find crates for"))
+        .arg(Arg::with_name("IGNORE")
+             .short("i")
+             .long("ignore")
+             .multiple(true)
+             .takes_value(true)
+             .help("ignore this crate"))
+        .arg(Arg::with_name("compile")
+             .short("c")
+             .long("compile")
+             .help("create a Cargo.toml containing the relevant crates and `cargo build` it \
+                    instead of printing to stdout"))
+        .get_matches();
+
+    let id = value_t_or_exit!(matches.value_of("id"), u32);
+    let sole_owner = matches.is_present("sole_owner");
+    let mut ignore = HashSet::new();
+    ignore.extend(matches.values_of("IGNORE").unwrap_or(Vec::new()).iter().map(|s| (**s).to_owned()));
+    let compile = matches.is_present("compile");
+
+    let crates = get_crates(id);
+
+    let filter = Filter {
+        sole_owner: sole_owner,
+        ignore: ignore,
+    };
+
+    if compile {
+        compile_crates(&crates, &filter);
+    } else {
+        write_crates(&mut io::stdout(), &crates, &filter);
+    }
+}
+
+fn get<T: serde::Deserialize>(endpoint: &str) -> T {
+    info!("getting `{}`", endpoint);
+    let client = hyper::Client::new();
+    let mut r = client.get(&format!("https://crates.io/api/v1/{}", endpoint)).send().unwrap();
+    serde_json::from_reader(&mut r).unwrap()
+}
+
+fn get_crates(id: u32) -> Vec<Crate> {
+    let mut crates = vec![];
+
+    for page in 1.. {
+        let page: Page = get(&format!("crates?user_id={}&page={}&per_page={}", id, page, PER_PAGE));
+        let should_break = (page.crates.len() as u64) < PER_PAGE;
+        crates.extend(page.crates);
+
+        if should_break {
+            break
+        }
+    }
+    crates
+}
+
+struct Filter {
+    sole_owner: bool,
+    ignore: HashSet<String>,
+}
+impl Filter {
+    fn should_include(&self, c: &Crate) -> bool {
+        if self.ignore.contains(&c.name) {
+            false
+        } else if self.sole_owner {
+            let owners: Owners = get(&format!("crates/{}/owners", c.name));
+            owners.users.len() == 1
+        } else {
+            true
+        }
+    }
+}
+
+fn write_crates(w: &mut Write,
+                crates: &[Crate],
+                filter: &Filter) {
+    for c in crates {
+        debug!("considering `{}`", c.name);
+        if filter.should_include(c) {
+            writeln!(w, "{} = \"{}\"", c.name, c.max_version).unwrap();
+        }
+    }
+}
+
+fn compile_crates(crates: &[Crate],
+                  filter: &Filter) {
+    let dir = tempdir::TempDir::new("check-crates").unwrap();
+
+    let mut f = File::create(dir.path().join("Cargo.toml")).unwrap();
+    f.write(br#"[package]
+name = "check-crates-tester"
+version = "0.1.0"
+
+[dependencies]
+"#).unwrap();
+    write_crates(&mut f, crates, filter);
+    f.flush().unwrap();
+    drop(f);
+
+    fs::create_dir(dir.path().join("src")).unwrap();
+    drop(File::create(dir.path().join("src/lib.rs")).unwrap());
+
+    let result = Command::new("cargo")
+        .current_dir(dir.path())
+        .arg("build")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .unwrap();
+    process::exit(result.code().unwrap());
+}

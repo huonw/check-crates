@@ -1,0 +1,19 @@
+[package]
+name = "check-crates"
+version = "0.1.0"
+authors = ["Huon Wilson <dbau.pp+github@gmail.com>"]
+
+build = "build.rs"
+
+[dependencies]
+hyper = "0.6"
+serde = "0.6"
+serde_json = "0.6"
+clap = "1.4"
+log = "0.3"
+env_logger = "0.3"
+tempdir = "0.3"
+
+[build-dependencies]
+serde_codegen = "0.5"
+syntex = "0.17"
